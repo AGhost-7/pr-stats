@@ -52,55 +52,130 @@ class GithubClient:
             body = await response.json()
             if response.status != 200 and response.status != 304:
                 raise Exception(url + ' - ' + body['message'])
-            return body
+            return {
+                'body': body,
+                'headers': response.headers,
+                'status': response.status
+            }
 
 
 async def with_reviews(args, client, pr):
+    """Add the pull request reviews to the body of the pull request"""
     url_part = '/repos/' + pr['head']['repo']['full_name'] + \
         '/pulls/' + str(pr['number']) + '/reviews'
-    body = await client.get(url_part)
-    pr['reviews'] = body
+    response = await client.get(url_part)
+    pr['reviews'] = response['body']
     return pr
 
 
+async def next_pr_page(client, es_client, repo, page, chunk):
+    """Returns a tuple where the first item is a boolean expressing whether the
+    page was modified. The second item returned is the response object either
+    from elasticsearch or github."""
+    search_result = await es_client.search(
+        index='pr-stats-page',
+        doc_type='pull_request_page',
+        body={
+            'query': {
+                'bool': {
+                    'filter': {
+                        'term': {'number': page}
+                    }
+                }
+            }
+        })
+
+    headers = {}
+    last_page = None
+    if len(search_result['hits']['hits']) > 0:
+        last_page = search_result['hits']['hits'][0]['_source']
+        headers['If-Modified-Since'] = last_page['timestamp']
+    response = await client.get(
+        '/repos/' + repo + '/pulls',
+        params={
+            'state': 'all',
+            'per_page': chunk,
+            'page': page,
+            'direction': 'asc',
+        },
+        headers=headers)
+
+    # Github returns a 304 with an empty body if the page was not modified.
+    if response['status'] == 304:
+        return False, last_page
+
+    await asyncio.wait([
+        with_reviews(args, client, pr)
+        for pr in response['body']
+    ])
+    return True, response
+
+
+async def bulk_update(es_client, repo, page, prs_response):
+    """Index the new page metadata and the pull requests into elasticsearch in
+    a single request"""
+    prs = prs_response['body']
+    body = []
+    for pr in prs:
+        body.append(json.dumps({
+            'index': {
+                '_index': 'pr-stats',
+                '_type': 'pull_request',
+                '_id': pr['id']
+            }
+        }))
+        body.append(json.dumps(pr))
+
+    body.append(json.dumps({
+        'index': {
+            '_index': 'pr-stats-page',
+            '_type': 'pull_request_page'
+        }
+    }))
+    body.append(json.dumps({
+        'number': page,
+        'repo': repo,
+        'count': len(prs),
+        'timestamp': prs_response['headers']['date'],
+    }))
+
+    response = await es_client.bulk(body='\n'.join(body))
+    if response['errors']:
+        for item in response['items']:
+            if 'error' in item['index']:
+                print('Error:', item['index']['error']['reason'])
+        raise Exception('Error in bulk indexing')
+
+
 async def index_repo_prs(args, client, es_client, repo):
+    """Indexes the pull requests of a specific repository. Skips pages that
+    have not been modified since the last batch indexing by using Github's
+    conditional requests."""
     page = 1
     chunk = 50
     while True:
-        prs = await client.get('/repos/' + repo + '/pulls', params={
-            'state': 'all', 'per_page': chunk, 'page': page})
-        await asyncio.wait([
-            with_reviews(args, client, pr)
-            for pr in prs
-        ])
-        body = []
-        for pr in prs:
-            body.append(json.dumps({
-                'index': {
-                    '_index': 'pr-stats',
-                    '_type': 'pull_request',
-                    '_id': pr['id']
-                }
-            }))
-            body.append(json.dumps(pr))
+        modified, prs_response = await next_pr_page(
+            client, es_client, repo, page, chunk)
+        count = None
+        if not modified:
+            count = prs_response['body']['count']
+            print('page ' + str(page) + ' not modified, skipping')
+        else:
+            count = len(prs_response['body'])
+            await bulk_update(es_client, repo, page, prs_response)
+            print('indexed ' + str(count) + ' records, page ' + str(page))
 
-        response = await es_client.bulk(body='\n'.join(body))
-        if response['errors']:
-            for item in response['items']:
-                print('Error:', item['index']['error']['reason'])
-            raise Exception('Error in bulk indexing')
-        print('indexed ' + str(len(prs)) + ' records')
-
-        if len(body) != chunk:
+        if count != chunk:
             break
         else:
             page += 1
 
+        print('Pausing for a few second to avoid rate limit')
+        await asyncio.sleep(5)
+
 
 async def create_index(es_client):
-    exists = await es_client.indices.exists(index='pr-stats')
-    if exists:
-        return
+    """Create the elasticsearch index if it does not exist"""
 
     text = {'type': 'text'}
     keyword = {'type': 'keyword'}
@@ -173,7 +248,7 @@ async def create_index(es_client):
             'closed_at': date,
             'merged_at': date,
             'merge_commit_sha': keyword,
-            'assignee': text,
+            'assignee': user_mapping,
             'head': {
                 'properties': {
                     'label': keyword,
@@ -195,19 +270,40 @@ async def create_index(es_client):
             'reviews': review_mapping
         }
     }
-    await es_client.indices.create(
-        index='pr-stats',
-        body={
-            'settings': {
-                'number_of_shards': 1,
-                'number_of_replicas': 0
-            },
-            'mappings': {
-                'pull_request': pr_mapping
-            }
+    page_mapping = {
+        'properties': {
+            'number': integer,
+            'timestamp': keyword,
+            'repo': keyword
         }
-    )
-    print('created index')
+    }
+
+    settings = {
+        'number_of_shards': 1,
+        'number_of_replicas': 0,
+        'blocks': {
+            'read_only_allow_delete': 'false',
+            'read_only': 'false'
+        }
+    }
+
+    indexes = [
+        {
+            'name': 'pr-stats',
+            'mappings': {'pull_request': pr_mapping}
+        },
+        {
+            'name': 'pr-stats-page',
+            'mappings': {'pull_request_page': page_mapping}
+        },
+    ]
+    for index in indexes:
+        exists = await es_client.indices.exists(index=index['name'])
+        if not exists:
+            await es_client.indices.create(
+                index=index['name'],
+                body={'settings': settings, 'mappings': index['mappings']})
+            print('created index:' + index['name'])
 
 
 async def index_all_repo_prs(args, es_client):

@@ -4,7 +4,13 @@ services:
     image: docker.elastic.co/elasticsearch/elasticsearch:6.1.0
     environment:
       ES_JAVA_OPTS: "-Xms512m -Xmx512m"
-      bootstrap.memory_lock: "false"
+      bootstrap.memory_lock: "true"
+      cluster.blocks.read_only_allow_delete: "false"
+    mem_limit: 1g
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
     volumes:
       - .elasticsearch:/usr/share/elasticsearch/data
     network_mode: host
@@ -13,3 +19,14 @@ services:
     environment:
       ELASTICSEARCH_URL: http://localhost:9200
     network_mode: host
+  python:
+    image: python:3.5.2
+    entrypoint: /pr-stats/entrypoint.sh
+    command: sleep Infinity
+    network_mode: host
+    working_dir: /pr-stats
+    volumes:
+      - ./:/pr-stats
+    environment:
+      - GH_USER
+      - GH_PASS
