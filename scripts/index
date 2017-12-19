@@ -32,6 +32,10 @@ def parse_args():
         help='Base url to the github api. Defaults to https://api.github.com.')
 
     parser.add_argument(
+        '--page', default=1, type=int,
+        help='What pull request page to start at')
+
+    parser.add_argument(
         'repositories', metavar='repo', nargs='+',
         help='Github repositories you want to fetch data from.')
 
@@ -59,10 +63,9 @@ class GithubClient:
             }
 
 
-async def with_reviews(args, client, pr):
+async def with_reviews(args, client, repo, pr):
     """Add the pull request reviews to the body of the pull request"""
-    url_part = '/repos/' + pr['head']['repo']['full_name'] + \
-        '/pulls/' + str(pr['number']) + '/reviews'
+    url_part = '/repos/' + repo + '/pulls/' + str(pr['number']) + '/reviews'
     response = await client.get(url_part)
     pr['reviews'] = response['body']
     return pr
@@ -105,7 +108,7 @@ async def next_pr_page(client, es_client, repo, page, chunk):
         return False, last_page
 
     await asyncio.wait([
-        with_reviews(args, client, pr)
+        with_reviews(args, client, repo, pr)
         for pr in response['body']
     ])
     return True, response
@@ -151,7 +154,7 @@ async def index_repo_prs(args, client, es_client, repo):
     """Indexes the pull requests of a specific repository. Skips pages that
     have not been modified since the last batch indexing by using Github's
     conditional requests."""
-    page = 1
+    page = args.page
     chunk = 50
     while True:
         modified, prs_response = await next_pr_page(
