@@ -1,0 +1,231 @@
+#!/usr/bin/env python3
+
+# vim: set ft=python:
+
+from argparse import ArgumentParser
+from os import environ
+import aiohttp
+import asyncio
+from elasticsearch_async import AsyncElasticsearch
+import json
+
+
+def parse_args():
+    parser = ArgumentParser()
+
+    user_params = {'help': 'Github username.'}
+    if 'GH_USER' in environ:
+        user_params['default'] = environ['GH_USER']
+    else:
+        user_params['required'] = True
+    parser.add_argument('--user', **user_params)
+
+    pass_params = {'help': 'Github password or token.'}
+    if 'GH_PASS' in environ:
+        pass_params['default'] = environ['GH_PASS']
+    else:
+        pass_params['required'] = True
+    parser.add_argument('--password', **pass_params)
+
+    parser.add_argument(
+        '--github-url', default='https://api.github.com',
+        help='Base url to the github api. Defaults to https://api.github.com.')
+
+    parser.add_argument(
+        'repositories', metavar='repo', nargs='+',
+        help='Github repositories you want to fetch data from.')
+
+    return parser.parse_args()
+
+
+class GithubClient:
+    def __init__(self, args, session):
+        self.session = session
+        self.args = args
+
+    async def get(self, url_part, **kwargs):
+        if 'headers' not in kwargs:
+            kwargs['headers'] = {}
+        kwargs['headers']['Accept'] = 'application/vnd.github.v3+json'
+        url = self.args.github_url + url_part
+        async with self.session.get(url, **kwargs) as response:
+            body = await response.json()
+            if response.status != 200 and response.status != 304:
+                raise Exception(url + ' - ' + body['message'])
+            return body
+
+
+async def with_reviews(args, client, pr):
+    url_part = '/repos/' + pr['head']['repo']['full_name'] + \
+        '/pulls/' + str(pr['number']) + '/reviews'
+    body = await client.get(url_part)
+    pr['reviews'] = body
+    return pr
+
+
+async def index_repo_prs(args, client, es_client, repo):
+    page = 1
+    chunk = 50
+    while True:
+        prs = await client.get('/repos/' + repo + '/pulls', params={
+            'state': 'all', 'per_page': chunk, 'page': page})
+        await asyncio.wait([
+            with_reviews(args, client, pr)
+            for pr in prs
+        ])
+        body = []
+        for pr in prs:
+            body.append(json.dumps({
+                'index': {
+                    '_index': 'pr-stats',
+                    '_type': 'pull_request',
+                    '_id': pr['id']
+                }
+            }))
+            body.append(json.dumps(pr))
+
+        response = await es_client.bulk(body='\n'.join(body))
+        if response['errors']:
+            for item in response['items']:
+                print('Error:', item['index']['error']['reason'])
+            raise Exception('Error in bulk indexing')
+        print('indexed ' + str(len(prs)) + ' records')
+
+        if len(body) != chunk:
+            break
+        else:
+            page += 1
+
+
+async def create_index(es_client):
+    exists = await es_client.indices.exists(index='pr-stats')
+    if exists:
+        return
+
+    text = {'type': 'text'}
+    keyword = {'type': 'keyword'}
+    integer = {'type': 'integer'}
+    url = text
+    date = {'type': 'date'}
+    boolean = {'type': 'boolean'}
+
+    user_mapping = {
+        'properties': {
+            'login': keyword,
+            'id': integer,
+            'url': url
+        }
+    }
+    repo_mapping = {
+        'properties': {
+            'id': integer,
+            'name': keyword,
+            'full_name': keyword,
+            'owner': user_mapping,
+            'private': boolean,
+            'description': text,
+            'fork': boolean,
+            'url': url,
+            'created_at': date,
+            'updated_at': date,
+            'homepage': url,
+            'stargazers_count': integer,
+            'watchers_count': integer,
+            'language': keyword,
+            'has_issues': boolean,
+            'has_projects': boolean,
+            'has_downloads': boolean,
+            'has_wiki': boolean,
+            'forks_count': integer,
+            'mirror_url': url,
+            'archived': boolean,
+            'open_issues_count': integer,
+            'license': keyword,
+            'forks': integer,
+            'open_issues': integer,
+            'watchers': integer,
+            'default_branch': keyword
+        }
+    }
+    review_mapping = {
+        'properties': {
+            'id': integer,
+            'user': user_mapping,
+            'body': text,
+            'state': keyword,
+            'author_association': keyword,
+            'submitted_at': date,
+            'commit_id': keyword
+        }
+    }
+    pr_mapping = {
+        'properties': {
+            'url': url,
+            'id': integer,
+            'state': keyword,
+            'locked': boolean,
+            'number': integer,
+            'title': text,
+            'user': user_mapping,
+            'body': text,
+            'created_at': date,
+            'updated_at': date,
+            'closed_at': date,
+            'merged_at': date,
+            'merge_commit_sha': keyword,
+            'assignee': text,
+            'head': {
+                'properties': {
+                    'label': keyword,
+                    'ref': text,
+                    'sha': keyword,
+                    'user': user_mapping,
+                    'repo': repo_mapping
+                }
+            },
+            'base': {
+                'properties': {
+                    'label': keyword,
+                    'ref': text,
+                    'sha': keyword,
+                    'user': user_mapping,
+                    'repo': repo_mapping
+                }
+            },
+            'reviews': review_mapping
+        }
+    }
+    await es_client.indices.create(
+        index='pr-stats',
+        body={
+            'settings': {
+                'number_of_shards': 1,
+                'number_of_replicas': 0
+            },
+            'mappings': {
+                'pull_request': pr_mapping
+            }
+        }
+    )
+    print('created index')
+
+
+async def index_all_repo_prs(args, es_client):
+    auth = aiohttp.BasicAuth(args.user, args.password)
+    async with aiohttp.ClientSession(auth=auth) as session:
+        client = GithubClient(args, session)
+        await create_index(es_client)
+        for repo in args.repositories:
+            print('Pulling data for repository', repo)
+            await index_repo_prs(args, client, es_client, repo)
+
+
+args = parse_args()
+es_client = AsyncElasticsearch(
+    hosts=['localhost'],
+    http_auth=('elastic', 'changeme'))
+loop = asyncio.get_event_loop()
+loop.run_until_complete(index_all_repo_prs(args, es_client))
+loop.run_until_complete(asyncio.sleep(0))
+loop.close()
+es_client.transport.close()
